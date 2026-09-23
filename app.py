@@ -3,11 +3,13 @@
 Customers pick how many breads they want, pay via PayLah! and collect at
 Pantry C, Level 3 (10:00–11:30 PM, Sun–Wed nights, while stock lasts).
 
+Customers pay by PayLah! first and upload a screenshot of the payment.
 The boss page (open with  ?boss  at the end of the URL) lets the owner:
   • open / close the shop
   • change the price and the stock quantity
-  • press "Payment collected" on an order -> stock drops, and a WhatsApp /
-    Telegram confirmation message is ready to send with one tap.
+  • see each payment screenshot, then delete it
+  • press "Payment collected" on an order -> stock drops
+  • tick people off the "To collect" list (tap their @handle to open Telegram)
 
 Shop settings + orders are saved in shop_data.json next to this file.
 Secrets (st.secrets): BOSS_PASSWORD (required for boss page),
@@ -19,7 +21,6 @@ import json
 import os
 import re
 import threading
-import urllib.parse
 from datetime import datetime
 
 import pytz
@@ -40,7 +41,7 @@ MAX_PER_ORDER = 10
 
 SGT = pytz.timezone("Asia/Singapore")
 HERO_IMAGE = "bread.png"      # add a bread photo with this name (optional)
-QR_IMAGE = "paynow_qr.png"
+PROOF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "payment_proofs")
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shop_data.json")
 
 st.set_page_config(page_title=SHOP_NAME, page_icon="🍞", layout="centered")
@@ -130,16 +131,31 @@ def confirm_text(o):
     )
 
 
-def confirm_link(o):
-    """WhatsApp link for a phone number, Telegram link for an @handle."""
-    contact = o["contact"].strip()
-    text = urllib.parse.quote(confirm_text(o))
-    if contact.startswith("@"):
-        return "Telegram", f"https://t.me/{contact[1:]}"
-    digits = re.sub(r"\D", "", contact)
-    if len(digits) == 8:
-        digits = "65" + digits
-    return "WhatsApp", f"https://wa.me/{digits}?text={text}"
+def clean_handle(text):
+    """'@ John_Tan ' / 't.me/john_tan' -> '@John_Tan'. Returns '' if invalid."""
+    h = text.strip().replace("https://", "").replace("t.me/", "").lstrip("@").strip()
+    return "@" + h if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", h) else ""
+
+
+def tg_link(handle):
+    return f"https://t.me/{handle.lstrip('@')}"
+
+
+def save_proof(order_id, upload):
+    os.makedirs(PROOF_DIR, exist_ok=True)
+    ext = os.path.splitext(upload.name)[1].lower() or ".jpg"
+    fname = f"{order_id}{ext}"
+    with open(os.path.join(PROOF_DIR, fname), "wb") as f:
+        f.write(upload.getvalue())
+    return fname
+
+
+def delete_proof(fname):
+    if fname:
+        try:
+            os.remove(os.path.join(PROOF_DIR, fname))
+        except Exception:
+            pass
 
 
 def send_telegram(chat_id, text):
@@ -287,10 +303,10 @@ def render_order_page():
                     unsafe_allow_html=True)
         name = st.text_input("Name", key="cust_name", disabled=disabled)
         contact = st.text_input(
-            "WhatsApp number or Telegram @handle",
+            "Telegram @handle",
             key="cust_contact",
-            placeholder="9123 4567 or @yourhandle",
-            help="We'll send your confirmation here after payment.",
+            placeholder="@yourhandle",
+            help="We'll message you on Telegram when your bread is ready.",
             disabled=disabled,
         )
         special = st.text_input("Notes (optional)", key="special", disabled=disabled)
@@ -303,10 +319,27 @@ def render_order_page():
         unsafe_allow_html=True,
     )
 
+    with st.container(border=True):
+        st.markdown('<div class="kt-section-label">💸 Pay by PayLah!</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f"1. Copy the number below and PayLah! **{money(total)}** to it:")
+        st.code(PAYLAH_NUMBER.replace(" ", ""), language=None)
+        st.markdown("2. Screenshot your payment and upload it here:")
+        proof = st.file_uploader("Payment screenshot", type=["png", "jpg", "jpeg", "webp"],
+                                 key="proof", disabled=disabled,
+                                 label_visibility="collapsed")
+
     if st.button("✅ Place My Order", type="primary", use_container_width=True,
                  disabled=disabled):
-        if not name.strip() or not contact.strip():
-            st.error("Please enter your name and WhatsApp number / Telegram handle.")
+        handle = clean_handle(contact)
+        if not name.strip():
+            st.error("Please enter your name.")
+            return
+        if not handle:
+            st.error("Please enter a valid Telegram handle, e.g. @yourhandle.")
+            return
+        if proof is None:
+            st.error("Please upload a screenshot of your PayLah! payment.")
             return
 
         def place(d):
@@ -316,11 +349,12 @@ def render_order_page():
                 return None, f"Sorry, only {available_qty(d)} left now. Please lower the quantity."
             p = float(d["price"])
             order = {
-                "id": d["next_id"], "name": name.strip(), "contact": contact.strip(),
+                "id": d["next_id"], "name": name.strip(), "contact": handle,
                 "qty": int(qty), "price": p, "total": round(p * qty, 2),
                 "special": special.strip(), "status": "pending",
                 "time": now_sgt().strftime("%d %b %I:%M %p"),
             }
+            order["proof"] = save_proof(order["id"], proof)
             d["next_id"] += 1
             d["orders"].append(order)
             return order, None
@@ -337,11 +371,11 @@ def render_order_page():
 
 def render_confirmation():
     o = st.session_state.order
-    st.markdown(f'<div class="kt-banner-open">📝 Order #{o["id"]} received — '
-                'please pay to confirm!</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kt-banner-open">✅ Order #{o["id"]} received — '
+                'thank you!</div>', unsafe_allow_html=True)
 
     rows = [("Order", f"#{o['id']}"), ("Bread", f"{o['qty']} x {money(o['price'])}"),
-            ("Name", o["name"]), ("Contact", o["contact"]),
+            ("Name", o["name"]), ("Telegram", o["contact"]),
             ("Collect at", MEETUP_POINT), ("Time", MEETUP_TIME)]
     if o["special"]:
         rows.append(("Notes", o["special"]))
@@ -353,22 +387,14 @@ def render_confirmation():
     st.markdown(f'<div class="kt-total"><div class="kt-total-final"><span>Total</span>'
                 f'<span>{money(o["total"])}</span></div></div>', unsafe_allow_html=True)
 
-    b64 = img_to_base64(QR_IMAGE)
-    if b64:
-        st.markdown(f'<img class="kt-qr" src="data:image/png;base64,{b64}" alt="PayLah QR">',
-                    unsafe_allow_html=True)
-
     st.markdown(
-        f'<div class="kt-pay">PayLah! <b>{money(o["total"])}</b> to <b>{PAYLAH_NUMBER}</b>.<br>'
-        f'Put <b>#{o["id"]}</b> in the payment note.<br>'
-        'You\'ll get a confirmation on WhatsApp/Telegram once payment is checked.</div>',
+        '<div class="kt-pay">We got your payment screenshot. 🙌<br>'
+        'We\'ll check it and message you on <b>Telegram</b> when it\'s confirmed.</div>',
         unsafe_allow_html=True,
     )
-    st.markdown('<div class="kt-footnote">Unpaid orders may be cancelled so others can buy. '
-                'While stock lasts!</div>', unsafe_allow_html=True)
 
     if st.button("🔄 Place Another Order", use_container_width=True):
-        for k in ["cust_name", "cust_contact", "special", "order"]:
+        for k in ["cust_name", "cust_contact", "special", "order", "proof"]:
             st.session_state.pop(k, None)
         st.session_state.submitted = False
         st.rerun()
@@ -377,6 +403,23 @@ def render_confirmation():
 # ---------------------------------------------------------------------------
 # Boss page  (open with ?boss at the end of the URL)
 # ---------------------------------------------------------------------------
+def render_proof(o):
+    """Show the payment screenshot with a delete button (boss page)."""
+    fname = o.get("proof")
+    if not fname or not os.path.exists(os.path.join(PROOF_DIR, fname)):
+        return
+    with st.expander("🧾 Payment screenshot"):
+        st.image(os.path.join(PROOF_DIR, fname))
+        if st.button("🗑️ Delete picture", key=f"delproof_{o['id']}", use_container_width=True):
+            def rm(d, oid=o["id"]):
+                for x in d["orders"]:
+                    if x["id"] == oid:
+                        delete_proof(x.get("proof"))
+                        x["proof"] = None
+            update_data(rm)
+            st.rerun()
+
+
 def render_boss_page():
     st.markdown('<div class="kt-section-label" style="text-align:center;font-size:1.4rem">'
                 '👑 Boss Page</div>', unsafe_allow_html=True)
@@ -397,7 +440,8 @@ def render_boss_page():
 
     data = load_data()
     pending = [o for o in data["orders"] if o["status"] == "pending"]
-    paid = [o for o in data["orders"] if o["status"] == "paid"]
+    paid = [o for o in data["orders"] if o["status"] == "paid"]  # paid, not yet collected
+    collected = [o for o in data["orders"] if o["status"] == "collected"]
 
     # --- Shop status
     with st.container(border=True):
@@ -433,14 +477,16 @@ def render_boss_page():
 
     # --- Pending orders
     with st.container(border=True):
-        st.markdown(f'<div class="kt-section-label">⏳ Waiting for payment ({len(pending)})</div>',
+        st.markdown(f'<div class="kt-section-label">🧾 Check payment ({len(pending)})</div>',
                     unsafe_allow_html=True)
         if not pending:
-            st.caption("No orders waiting.")
+            st.caption("No payments to check.")
         for o in pending:
             st.markdown(f"**#{o['id']} · {o['name']}** — {o['qty']} x bread · "
-                        f"**{money(o['total'])}**  \n{o['contact']} · {o['time']}"
+                        f"**{money(o['total'])}**  \n[{o['contact']}]({tg_link(o['contact'])})"
+                        f" · {o['time']}"
                         + (f"  \n📝 {o['special']}" if o["special"] else ""))
+            render_proof(o)
             b1, b2 = st.columns(2)
             if b1.button("💰 Payment collected", key=f"paid_{o['id']}",
                          use_container_width=True):
@@ -456,33 +502,49 @@ def render_boss_page():
                     for x in d["orders"]:
                         if x["id"] == oid and x["status"] == "pending":
                             x["status"] = "cancelled"
+                            delete_proof(x.get("proof"))
+                            x["proof"] = None
                 update_data(cancel)
                 st.rerun()
             st.divider()
 
     # --- Paid orders (send confirmation)
     with st.container(border=True):
-        st.markdown(f'<div class="kt-section-label">✅ Paid — send confirmation ({len(paid)})</div>',
-                    unsafe_allow_html=True)
+        st.markdown(f'<div class="kt-section-label">📦 To collect ({len(paid)} people · '
+                    f'{sum(o["qty"] for o in paid)} breads)</div>', unsafe_allow_html=True)
         if not paid:
-            st.caption("No paid orders yet.")
-        for o in reversed(paid):
-            app_name, link = confirm_link(o)
-            st.markdown(f"**#{o['id']} · {o['name']}** — {o['qty']} x bread · "
-                        f"{money(o['total'])} · {o['contact']}")
-            st.link_button(f"📲 Open {app_name} chat", link, use_container_width=True)
-            if app_name == "Telegram":
-                st.caption("Copy this message and paste it in the chat:")
+            st.caption("Nobody waiting to collect.")
+        for o in paid:
+            c1, c2 = st.columns([3, 2], vertical_alignment="center")
+            c1.markdown(f"**{o['name']}** — {o['qty']} bread{'s' if o['qty'] != 1 else ''}  \n"
+                        f"[{o['contact']}]({tg_link(o['contact'])}) · #{o['id']}")
+            if c2.button("✅ Collected", key=f"collect_{o['id']}", use_container_width=True):
+                def mark_collected(d, oid=o["id"]):
+                    for x in d["orders"]:
+                        if x["id"] == oid and x["status"] == "paid":
+                            x["status"] = "collected"
+                update_data(mark_collected)
+                st.rerun()
+            with st.expander("📲 Confirmation message to copy"):
                 st.code(confirm_text(o), language=None)
-        if paid:
-            st.caption(f"Tonight: {sum(o['qty'] for o in paid)} breads sold · "
-                       f"{money(sum(o['total'] for o in paid))} collected")
+            render_proof(o)
+
+    # --- Tonight's summary
+    sold = paid + collected
+    if sold:
+        st.caption(f"Tonight: {sum(o['qty'] for o in sold)} breads sold · "
+                   f"{money(sum(o['total'] for o in sold))} received · "
+                   f"{len(collected)} collected, {len(paid)} still to collect")
 
     # --- Reset for next night
     with st.expander("🧹 Start a new night (clear all orders)"):
         st.caption("Removes all orders from the list. Stock and price stay as they are.")
         if st.button("Clear orders", use_container_width=True):
-            update_data(lambda d: d.update(orders=[]))
+            def clear(d):
+                for x in d["orders"]:
+                    delete_proof(x.get("proof"))
+                d["orders"] = []
+            update_data(clear)
             st.rerun()
 
     if st.button("Log out", use_container_width=True):
